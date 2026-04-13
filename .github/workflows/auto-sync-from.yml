@@ -1,0 +1,224 @@
+name: 个人仓库 → 组织B中转仓 自动同步 (Pro)
+
+# 运行方式：自动定时 + 手动触发
+on:
+  schedule:
+    - cron: '0 0 * * *'  # UTC 0点 = 北京时间 8点，每天自动同步
+  workflow_dispatch:        # 支持手动点击运行
+
+# 全局环境变量（统一配置，方便维护）
+env:
+  # 来源：你的个人GitHub账号（替换成你自己的ID）
+  PERSONAL_ACCOUNT: TuiTianXia
+  # 需要同步的目录
+  SYNC_FOLDER: doc
+  # 提交备注
+  COMMIT_MESSAGE: Sync from personal repo to Data-Hub
+  # 邮箱配置（失败通知用）
+  EMAIL_USER: qin810326@163.com
+  EMAIL_PWD: RVptUcS59gDDRcQJ
+  EMAIL_TO: 944417225@qq.com
+  SMTP_HOST: smtp.163.com
+  SMTP_PORT: 465
+
+jobs:
+  auto-sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5          # 超时防止卡死
+    permissions:
+      contents: write           # 赋予中转仓写入权限
+
+    steps:
+      # 步骤1：拉取当前中转仓（Data-Hub）代码
+      - name: 拉取组织B中转仓代码
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 1         # 只拉取最新提交，加速运行
+          ref: main
+
+      # 步骤1.5：日志隐藏邮箱密码，避免泄露
+      - name: 隐藏日志敏感信息
+        run: echo "::add-mask::${{ env.EMAIL_PWD }}"
+
+      # 步骤2：【核心防护1】前置HTTP校验，拦截301重定向/无效仓库
+      - name: 前置校验目标地址
+        run: |
+          # 构造预期的个人仓库地址
+          EXPECTED_ORG="${{ env.PERSONAL_ACCOUNT }}"
+          EXPECTED_REPO="${{ github.event.repository.name }}"
+          REPO_URL="https://github.com/$EXPECTED_ORG/$EXPECTED_REPO"
+          
+          echo "【预期同步仓库】：$EXPECTED_ORG/$EXPECTED_REPO"
+          echo "【检查仓库URL】：$REPO_URL"
+
+          # 仅请求HTTP头，不跟随重定向，获取状态码
+          HTTP_CODE=$(curl -I -f -o /dev/null -s -w "%{http_code}" "$REPO_URL")
+          echo "【HTTP状态码】：$HTTP_CODE"
+
+          if [ "$HTTP_CODE" != "200" ]; then
+            echo "❌ 【错误拦截】仓库URL返回非200状态码：$HTTP_CODE"
+            echo "原因：仓库已改名/重定向/不存在。"
+            echo "已终止同步，绝对不会拉取错误仓库！"
+            exit 1
+          fi
+
+          echo "✅ 仓库URL状态正常，无重定向，继续执行"
+
+      # 步骤3：拉取个人同名仓库代码（用组织级PERSONAL_TOKEN）
+      - name: 拉取个人同名仓库
+        uses: actions/checkout@v5
+        with:
+          repository: ${{ env.PERSONAL_ACCOUNT }}/${{ github.event.repository.name }}
+          path: personal_repo          # 个人仓库代码存放目录
+          fetch-depth: 1
+          ref: main
+          # 读取组织级Secret里的精细化Token，仅个人仓库只读权限
+          token: ${{ secrets.PERSONAL_TOKEN }}
+
+      # 步骤4：【核心防护2】校验源仓库真实身份，防止拉错仓库
+      - name: 校验源仓库的身份
+        run: |
+          cd personal_repo
+          # 获取仓库唯一真实URL（改名、重定向都改不了的永久标识）
+          REPO_URL=$(git remote get-url origin)
+          echo "【实际拉取的真实URL】：$REPO_URL"
+
+          # 贪婪匹配完整仓库名，绝对不截断
+          if [[ $REPO_URL =~ github\.com[:/]([^/]+)/([^/]+)(\.git)?$ ]]; then
+            ACTUAL_ORG="${BASH_REMATCH[1]}"
+            ACTUAL_REPO="${BASH_REMATCH[2]}"
+          else
+            echo "❌ 无法解析仓库真实URL"
+            echo "已终止同步"
+            exit 1
+          fi
+
+          # 双重校验：账号名+仓库名必须100%一致
+          EXPECTED_ORG="${{ env.PERSONAL_ACCOUNT }}"
+          EXPECTED_REPO="${{ github.event.repository.name }}"
+          if [ "$ACTUAL_ORG" != "$EXPECTED_ORG" ] || [ "$ACTUAL_REPO" != "$EXPECTED_REPO" ]; then
+            echo "❌ 【错误拦截】拉取的仓库与预期不符！"
+            echo "预期：$EXPECTED_ORG/$EXPECTED_REPO"
+            echo "实际：$ACTUAL_ORG/$ACTUAL_REPO"
+            echo "已终止同步，绝对不会拉取错误仓库！"
+            exit 1
+          fi
+
+          # 防清空校验：源同步目录必须存在，防止中转仓被清空
+          if [ ! -d "./${{ env.SYNC_FOLDER }}" ]; then
+            echo "❌ 【防清空拦截】个人仓库无 ${{ env.SYNC_FOLDER }} 目录"
+            echo "已终止同步，防止中转仓被清空"
+            exit 1
+          fi
+
+          echo "✅ 源仓库身份校验通过，同步目录存在"
+
+      # 步骤5：检查是否有更新（零报错版，避免diff非0退出）
+      - name: 检查远程有无更新
+        id: check_diff
+        run: |
+          SOURCE_DIR="./personal_repo/${{ env.SYNC_FOLDER }}"
+          TARGET_DIR="./${{ env.SYNC_FOLDER }}"
+
+          # 首次同步：中转仓无目标目录，直接判定有更新
+          if [ ! -d "$TARGET_DIR" ]; then
+            echo "has_change=true" >> $GITHUB_OUTPUT
+            echo "ℹ️ 首次同步，目标目录不存在"
+            exit 0
+          fi
+
+          # 强制diff永远返回0，将差异写入临时文件
+          diff -r "$SOURCE_DIR" "$TARGET_DIR" > diff_output.txt || true
+
+          # 用文件大小判断差异：非空=有更新
+          if [ -s diff_output.txt ]; then
+            echo "has_change=true" >> $GITHUB_OUTPUT
+            echo "✅ 源仓库有更新，准备同步"
+          else
+            echo "has_change=false" >> $GITHUB_OUTPUT
+            echo "ℹ️ 源仓库无更新，跳过同步"
+          fi
+
+          # 清理临时文件
+          rm -f diff_output.txt
+
+      # 步骤6：【防清空兜底】二次校验源目录，双重保险
+      - name: 二次校验远程目录
+        if: steps.check_diff.outputs.has_change == 'true'
+        run: |
+          if [ ! -d "./personal_repo/${{ env.SYNC_FOLDER }}" ]; then
+            echo "❌ 源目录不存在，终止同步"
+            exit 1
+          fi
+          echo "✅ 源目录二次校验通过"
+
+      # 步骤7：覆盖同步目标目录，完全同步个人仓库doc内容
+      - name: 覆盖同步本地目录
+        if: steps.check_diff.outputs.has_change == 'true'
+        run: |
+          echo ">>> 开始同步 ${{ env.SYNC_FOLDER }} 目录"
+          # 先删除中转仓旧目录，再复制个人仓库新目录
+          rm -rf "./${{ env.SYNC_FOLDER }}"
+          cp -r "./personal_repo/${{ env.SYNC_FOLDER }}" ./
+          echo "✅ 同步完成，中转仓目录已完全覆盖"
+
+      # 步骤8：提交推送同步结果到中转仓
+      - name: 提交推送同步结果
+        if: steps.check_diff.outputs.has_change == 'true'
+        run: |
+          git config user.name "GitHub Actions"
+          git config user.email "actions@github.com"
+          git add "./${{ env.SYNC_FOLDER }}"
+          git commit -m "${{ env.COMMIT_MESSAGE }}"
+          git push origin main
+          echo "✅ 同步结果已提交并推送至Data-Hub中转仓"
+
+      # 步骤9：记录失败北京时间，用于邮件通知
+      - name: 记录失败北京时间
+        if: failure()
+        run: |
+          FAIL_TIME=$(TZ=Asia/Shanghai date +"%Y-%m-%d %H:%M:%S")
+          echo "FAIL_TIME=$FAIL_TIME" >> "$GITHUB_ENV"
+
+      # 步骤10：失败发送邮件通知（完整HTML模板）
+      - name: 失败发送邮件通知
+        if: failure()
+        uses: dawidd6/action-send-mail@v15
+        with:
+          server_address: ${{ env.SMTP_HOST }}
+          server_port: ${{ env.SMTP_PORT }}
+          username: ${{ env.EMAIL_USER }}
+          password: ${{ env.EMAIL_PWD }}
+          subject: "⚠️ 同步失败：${{ github.repository }}"
+          to: ${{ env.EMAIL_TO }}
+          from: "同步提醒 <${{ env.EMAIL_USER }}>"
+          html_body: |
+            <!DOCTYPE html>
+            <html lang="zh-CN">
+            <head>
+                <meta charset="UTF-8">
+                <meta name="viewport" content="width=device-width, initial-scale=1.0">
+                <title>同步失败通知</title>
+            </head>
+            <body style="margin:0;padding:20px;background:#f5f5f5;font-family:system-ui,-apple-system,sans-serif;">
+                <div style="max-width:600px;margin:0 auto;background:#fff;border-radius:8px;overflow:hidden;box-shadow:0 2px 12px rgba(0,0,0,0.08);">
+                    <div style="background:#dc3545;padding:20px;text-align:center;">
+                        <h1 style="margin:0;color:#fff;font-size:22px;">🚨 自动同步任务失败</h1>
+                    </div>
+                    <div style="padding:24px;">
+                        <p style="font-size:16px;color:#333;line-height:1.5;">GitHub 自动同步任务执行失败，请立即排查！</p>
+                        <div style="background:#f8f9fa;padding:16px;border-radius:6px;margin:20px 0;">
+                            <ul style="margin:0;padding:0;list-style:none;">
+                                <li style="margin-bottom:12px;font-size:15px;">❌ 目标仓库：${{ github.repository }}</li>
+                                <li style="margin-bottom:12px;font-size:15px;">🔧 任务名称：${{ github.workflow }}</li>
+                                <li style="margin-bottom:12px;font-size:15px;">⚡ 触发方式：${{ github.event_name == 'schedule' && '定时运行' || '手动运行' }}</li>
+                                <li style="margin-bottom:12px;font-size:15px;">🕐 失败时间（北京）：${{ env.FAIL_TIME }}</li>
+                            </ul>
+                        </div>
+                        <div style="text-align:center;margin-top:20px;">
+                            <a href="https://github.com/${{ github.repository }}/actions" style="display:inline-block;background:#0071e2;color:#fff;padding:10px 20px;border-radius:6px;text-decoration:none;">查看执行日志</a>
+                        </div>
+                    </div>
+                </div>
+            </body>
+            </html>
