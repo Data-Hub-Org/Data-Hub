@@ -1,0 +1,55 @@
+name: 批量更新所有私有仓库的PERSONAL_TOKEN
+on:
+  workflow_dispatch:  # Token过期时手动跑一次
+
+jobs:
+  batch-update:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 获取组织B所有私有仓库
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.ORG_ADMIN_TOKEN }}
+          script: |
+            const repos = await github.paginate('GET /orgs/{org}/repos', {
+              org: 'Data-Hub-Org',
+              type: 'private',
+              per_page: 100
+            });
+            const repoNames = repos.map(repo => repo.name);
+            console.log(`找到 ${repoNames.length} 个私有仓库`);
+            return repoNames;
+          result-encoding: string
+        id: get-repos
+
+      - name: 批量更新每个仓库的PERSONAL_TOKEN
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.ORG_ADMIN_TOKEN }}
+          script: |
+            const repoNames = ${{ steps.get-repos.outputs.result }};
+            const personalToken = "${{ secrets.PERSONAL_TOKEN }}";
+
+            for (const repoName of repoNames) {
+              console.log(`正在更新：${repoName}`);
+              // 获取仓库公钥用于加密
+              const { key, key_id } = await github.rest.actions.getRepoPublicKey({
+                owner: 'Data-Hub-Org',
+                repo: repoName
+              });
+              // 加密Token
+              const sodium = require('tweetsodium');
+              const messageBytes = Buffer.from(personalToken);
+              const keyBytes = Buffer.from(key, 'base64');
+              const encryptedBytes = sodium.seal(messageBytes, keyBytes);
+              const encryptedValue = Buffer.from(encryptedBytes).toString('base64');
+              // 创建/更新仓库级Secret
+              await github.rest.actions.createOrUpdateRepoSecret({
+                owner: 'Data-Hub-Org',
+                repo: repoName,
+                secret_name: 'PERSONAL_TOKEN',
+                encrypted_value: encryptedValue,
+                key_id: key_id
+              });
+            }
+            console.log('✅ 所有私有仓库的PERSONAL_TOKEN更新完成！');
