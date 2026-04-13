@@ -1,98 +1,37 @@
-name: 固定个人仓库 → 组织B中转仓 同步
+name: 生成加密Token文件（仅Token过期时运行一次）
 
 on:
-  schedule:
-    - cron: '0 0 * * *' # 每天自动同步（北京时间8点）
-  workflow_dispatch:     # 支持手动点击运行
-
-# 👇 所有名称全部写死，请勿修改
-env:
-  # ⚠️ 这里个人仓库名写死了！！！
-  # 必须改成你个人真实存在的仓库名（例如：web.tmtui.com）
-  PERSONAL_REPO_NAME: "web.tmtui.com" 
-  PERSONAL_ACCOUNT: "TuiTianXia"      # 个人账号写死
-  SYNC_FOLDER: "doc"                  # 同步目录写死
-  EMAIL_USER: "qin810326@163.com"
-  EMAIL_PWD: "RVptUcS59gDDRcQJ"
-  EMAIL_TO: "944417225@qq.com"
-  SMTP_HOST: "smtp.163.com"
-  SMTP_PORT: "465"
+  workflow_dispatch:  # 手动触发，Token过期时跑一次
 
 jobs:
-  sync:
+  generate-token:
     runs-on: ubuntu-latest
-    timeout-minutes: 5
     permissions:
-      contents: write
+      contents: write  # 允许推送文件到中转仓
 
     steps:
       - name: 拉取中转仓代码
         uses: actions/checkout@v5
         with:
           fetch-depth: 1
-          ref: main
 
-      - name: 隐藏敏感信息
-        run: echo "::add-mask::${{ env.EMAIL_PWD }}"
-
-      # 3. 前置校验（写死个人仓库地址）
-      - name: 校验个人仓库是否存在
+      # 核心：用GitHub自带的加密工具，加密Token
+      - name: 加密PERSONAL_TOKEN并生成文件
         run: |
-          # 直接写死你要同步的那个个人仓库名字
-          REPO_URL="https://github.com/${{ env.PERSONAL_ACCOUNT }}/${{ env.PERSONAL_REPO_NAME }}"
-          echo "【正在校验】：$REPO_URL"
+          # 读取组织级Secret里的Token
+          TOKEN="${{ secrets.PERSONAL_TOKEN }}"
           
-          # 兼容私有仓库（401）和公开仓库（200），其他状态码报错
-          HTTP_CODE=$(curl -I -f -o /dev/null -s -w "%{http_code}" "$REPO_URL")
-          if [[ "$HTTP_CODE" != "200" && "$HTTP_CODE" != "401" ]]; then
-            echo "❌ 仓库不存在或无法访问：$HTTP_CODE"
-            exit 1
-          fi
-          echo "✅ 仓库访问正常"
+          # 用GitHub Actions自带的加密命令加密
+          echo "$TOKEN" | openssl enc -aes-256-cbc -salt -pbkdf2 -k "${{ secrets.GITHUB_TOKEN }}" -out token.enc
+          
+          echo "✅ Token加密完成，生成token.enc文件"
 
-      # 4. 拉取个人仓库（写死仓库名，使用精细化Token）
-      - name: 拉取个人仓库代码
-        uses: actions/checkout@v5
-        with:
-          # 👇 这里写死个人仓库名，绝对不会错
-          repository: "${{ env.PERSONAL_ACCOUNT }}/${{ env.PERSONAL_REPO_NAME }}"
-          path: personal_repo
-          fetch-depth: 1
-          ref: main
-          token: ${{ secrets.PERSONAL_TOKEN }}
-
-      # 5. 校验拉取结果
-      - name: 校验源目录
+      # 把加密后的Token文件推送到中转仓
+      - name: 推送加密Token文件
         run: |
-          if [ ! -d "personal_repo/${{ env.SYNC_FOLDER }}" ]; then
-            echo "❌ 个人仓库内未找到 ${{ env.SYNC_FOLDER }} 目录"
-            exit 1
-          fi
-          echo "✅ 找到同步目录"
-
-      # 6. 检查更新
-      - name: 检查是否有变更
-        id: check
-        run: |
-          if [ ! -d "${{ env.SYNC_FOLDER }}" ]; then
-            echo "has_change=true" >> $GITHUB_OUTPUT
-            exit 0
-          fi
-          # 对比内容，有变化就继续
-          if diff -r "personal_repo/${{ env.SYNC_FOLDER }}" "${{ env.SYNC_FOLDER }}" >/dev/null; then
-            echo "has_change=false" >> $GITHUB_OUTPUT
-          else
-            echo "has_change=true" >> $GITHUB_OUTPUT
-          fi
-
-      # 7. 覆盖同步
-      - name: 执行同步
-        if: steps.check.outputs.has_change == 'true'
-        run: |
-          rm -rf ${{ env.SYNC_FOLDER }}
-          cp -r personal_repo/${{ env.SYNC_FOLDER }} ./
           git config user.name "GitHub Actions"
           git config user.email "actions@github.com"
-          git add ${{ env.SYNC_FOLDER }}
-          git commit -m "${{ env.COMMIT_MESSAGE }}"
+          git add token.enc
+          git commit -m "更新加密Token文件"
           git push origin main
+          echo "✅ 加密Token文件已推送到中转仓"
